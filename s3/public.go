@@ -53,7 +53,9 @@ type PublishedStorage struct {
 	plusWorkaround   bool
 	disableMultiDel  bool
 	pathCache        map[string]string
-
+	multipartUplaod  bool
+	// if multipartUpload is enabled, use this size. in bytes
+	uploadPartSize   int
 	// True if the bucket encrypts objects by default.
 	encryptByDefault bool
 }
@@ -66,7 +68,8 @@ var (
 // NewPublishedStorageRaw creates published storage from raw aws credentials
 func NewPublishedStorageRaw(
 	bucket, defaultACL, prefix, storageClass, encryptionMethod string,
-	plusWorkaround, disabledMultiDel, forceVirtualHostedStyle bool,
+	uploadPartSize int,
+	plusWorkaround, disabledMultiDel, forceVirtualHostedStyle, multipartUpload bool,
 	config *aws.Config, endpoint string,
 ) (*PublishedStorage, error) {
 	var acl types.ObjectCannedACL
@@ -80,6 +83,10 @@ func NewPublishedStorageRaw(
 
 	if storageClass == string(types.StorageClassStandard) {
 		storageClass = ""
+	}
+
+	if multipartUplaod && uploadPartSize < (5 * 1024 * 1024) {
+		uploadPartSize = 5 * 1024 * 1024
 	}
 
 	var baseEndpoint *string
@@ -98,6 +105,9 @@ func NewPublishedStorageRaw(
 		acl:              acl,
 		prefix:           prefix,
 		storageClass:     types.StorageClass(storageClass),
+		multipartUplaod:  multipartUplaod,
+		// if multipartUpload is enabled, use this size. in Megabyte
+		uploadPartSize:   uploadPartSize,
 		encryptionMethod: types.ServerSideEncryption(encryptionMethod),
 		plusWorkaround:   plusWorkaround,
 		disableMultiDel:  disabledMultiDel,
@@ -127,7 +137,8 @@ func (storage *PublishedStorage) setKMSFlag() {
 // keys, region and bucket name
 func NewPublishedStorage(
 	accessKey, secretKey, sessionToken, region, endpoint, bucket, defaultACL, prefix, storageClass, encryptionMethod string,
-	plusWorkaround, disableMultiDel, _, forceVirtualHostedStyle, debug bool) (*PublishedStorage, error) {
+	uploadPartSize int,
+	plusWorkaround, disableMultiDel, _, forceVirtualHostedStyle, multipartUpload, debug bool) (*PublishedStorage, error) {
 
 	opts := []func(*config.LoadOptions) error{config.WithRegion(region)}
 	if accessKey != "" {
@@ -143,8 +154,7 @@ func NewPublishedStorage(
 		return nil, err
 	}
 
-	result, err := NewPublishedStorageRaw(bucket, defaultACL, prefix, storageClass,
-		encryptionMethod, plusWorkaround, disableMultiDel, forceVirtualHostedStyle, &config, endpoint)
+	result, err := NewPublishedStorageRaw(bucket, defaultACL, prefix, storageClass, encryptionMethod, uploadPartSize, plusWorkaround, disableMultiDel, forceVirtualHostedStyle, multipartUpload, &config, endpoint)
 
 	return result, err
 }
@@ -180,6 +190,8 @@ func (storage *PublishedStorage) PutFile(path string, sourceFilename string) err
 	return err
 }
 
+
+
 // getMD5 retrieves MD5 stored in the metadata, if any
 func (storage *PublishedStorage) getMD5(path string) (string, error) {
 	params := &s3.HeadObjectInput{
@@ -196,19 +208,108 @@ func (storage *PublishedStorage) getMD5(path string) (string, error) {
 
 // putFile uploads file-like object to
 func (storage *PublishedStorage) putFile(path string, source io.ReadSeeker, sourceMD5 string) error {
+	// If multipart upload is enabled
+	if storage.multipart {
+		// Start the multipart upload
+		initResp, err := storage.s3.CreateMultipartUpload(context.TODO(), &s3.CreateMultipartUploadInput{
+			Bucket: aws.String(storage.bucket),
+			Key:    aws.String(filepath.Join(storage.prefix, path)),
+			ACL:    storage.acl,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to start multipart upload: %v", err)
+		}
 
+		// Calculate part size and number of parts
+		partSize := storage.uploadPartSize
+		var partNumber int32 = 1
+		uploadedParts := []types.CompletedPart{}
+
+		// Read source in chunks (parts)
+		var buf = make([]byte, partSize)
+		for {
+			n, err := source.Read(buf)
+			if err == io.EOF && n == 0 {
+				break
+			} else if err != nil {
+				return fmt.Errorf("failed to read source file: %v", err)
+			}
+
+			// Upload part
+			uploadPartResp, err := storage.s3.UploadPart(context.TODO(), &s3.UploadPartInput{
+				Bucket:     aws.String(storage.bucket),
+				Key:        aws.String(filepath.Join(storage.prefix, path)),
+				PartNumber: partNumber,
+				UploadId:   initResp.UploadId,
+				Body:       bytes.NewReader(buf[:n]), // Directly use bytes.NewReader
+			})
+			if err != nil {
+				// Abort the multipart upload on error
+				aboInput := &s3.AbortMultipartUploadInput{
+					Bucket:   initResp.Bucket,
+					Key:      initResp.Key,
+					UploadId: initResp.UploadId,
+				}
+				_, aboErr := storage.s3.AbortMultipartUpload(context.TODO(), aboInput)
+				if aboErr != nil {
+					return aboErr
+				}
+				return fmt.Errorf("failed to upload part %d: %v", partNumber, err)
+			}
+
+			// Store the part
+			uploadedParts = append(uploadedParts, types.CompletedPart{
+				ETag:       uploadPartResp.ETag,
+				PartNumber: partNumber,
+			})
+
+			partNumber++
+		}
+
+		// Complete the multipart upload
+		_, err = storage.s3.CompleteMultipartUpload(context.TODO(), &s3.CompleteMultipartUploadInput{
+			Bucket:   initResp.Bucket,
+			Key:      initResp.Key,
+			UploadId: initResp.UploadId,
+			MultipartUpload: &types.CompletedMultipartUpload{
+				Parts: uploadedParts,
+			},
+		})
+
+		// If completion fails, abort the upload
+		if err != nil {
+			// Abort the multipart upload
+			aboInput := &s3.AbortMultipartUploadInput{
+				Bucket:   initResp.Bucket,
+				Key:      initResp.Key,
+				UploadId: initResp.UploadId,
+			}
+			_, aboErr := storage.s3.AbortMultipartUpload(context.TODO(), aboInput)
+			if aboErr != nil {
+				return fmt.Errorf("failed to abort multipart upload: %v", aboErr)
+			}
+			return fmt.Errorf("failed to complete multipart upload: %v", err)
+		}
+
+		return nil
+	}
+
+	// Use single part upload
 	params := &s3.PutObjectInput{
 		Bucket: aws.String(storage.bucket),
 		Key:    aws.String(filepath.Join(storage.prefix, path)),
 		Body:   source,
 		ACL:    storage.acl,
 	}
+
 	if storage.storageClass != "" {
 		params.StorageClass = types.StorageClass(storage.storageClass)
 	}
+
 	if storage.encryptionMethod != "" {
 		params.ServerSideEncryption = types.ServerSideEncryption(storage.encryptionMethod)
 	}
+
 	if sourceMD5 != "" {
 		params.Metadata = map[string]string{
 			"Md5": sourceMD5,
@@ -220,14 +321,15 @@ func (storage *PublishedStorage) putFile(path string, source io.ReadSeeker, sour
 		return err
 	}
 
+	// Handle + workaround if necessary
 	if storage.plusWorkaround && strings.Contains(path, "+") {
 		_, err = source.Seek(0, 0)
 		if err != nil {
 			return err
 		}
-
 		return storage.putFile(strings.Replace(path, "+", " ", -1), source, sourceMD5)
 	}
+
 	return nil
 }
 

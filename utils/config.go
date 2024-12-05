@@ -118,6 +118,8 @@ type S3PublishRoot struct {
 	Prefix                  string `json:"prefix"`
 	ACL                     string `json:"acl"`
 	StorageClass            string `json:"storageClass"`
+	MultipartUpload			bool   `json:"multipartUpload"`
+	UploadPartSize			int    `json:"uploadPartSize"`
 	EncryptionMethod        string `json:"encryptionMethod"`
 	PlusWorkaround          bool   `json:"plusWorkaround"`
 	DisableMultiDel         bool   `json:"disableMultiDel"`
